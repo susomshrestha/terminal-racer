@@ -1,6 +1,7 @@
 import curses
 import time
 from curses import textpad
+from dataclasses import dataclass
 from typing import Optional
 
 # Layout
@@ -25,14 +26,30 @@ DEFAULT_CELL = (" ", 0)
 ROAD_COLOR_PAIR = 1
 
 # Timing
-FRAME_DELAY = 0.033  # seconds between frames (~30 FPS)
-SCROLL_FRAME_INTERVAL = (
-    5  # TEMPORARY: move the road every N frames
-)
+TARGET_FPS = 30  # frames per second the loop aims for
+FRAME_TIME = 1 / TARGET_FPS  # seconds each frame should take
+
+# Speed progression
+INITIAL_SPEED = 6.0
+MAX_SPEED = 18.0
+SPEED_INTERVAL = 5.0
+SPEED_INCREASE_AMOUNT = 1.0
 
 # Lanes
 LEFT_LANE = 0
 RIGHT_LANE = 1
+
+
+@dataclass
+class GameState:
+    car_lane: int = LEFT_LANE
+    offset: int = 0
+    speed: float = INITIAL_SPEED
+    fractional_movement: float = 0.0
+    start_time: float = 0.0
+    previous_update_time: float = 0.0
+    next_speed_increase: float = 0.0
+
 
 # Commands (what the player wants to do, independent of which key they pressed)
 CMD_LEFT = "left"
@@ -62,30 +79,44 @@ ROW_TEMPLATES = [build_row_template(DIVIDER_CHAR)] + [
 ]
 
 
-def main(stdscr: curses.window):
-    """Run the game loop: read input, update state, draw, repeat."""
+def main(stdscr: curses.window) -> tuple[list[float], list[float]]:
+    """Run the game loop with elapsed-time movement and deadline scheduling.
+
+    Returns:
+        A tuple containing frame-start intervals and frame work durations,
+        both measured in seconds.
+    """
     setup_curses(stdscr)
 
     height, width = stdscr.getmaxyx()
     center, road_top, road_bottom = compute_layout(height, width)
     cell_styles = build_road_dict()
 
-    car_lane = LEFT_LANE
-    offset = 0
-    frame_count = 0
+    start_time = time.perf_counter()
+    state = GameState(
+        start_time=start_time,
+        previous_update_time=start_time,
+        next_speed_increase=start_time + SPEED_INTERVAL,
+    )
+
     is_game_running = True
 
+    frame_times: list[float] = []
+    work_times: list[float] = []
+
+    next_frame_deadline = start_time + FRAME_TIME
+    previous_frame_start = None
+
     while is_game_running:
+        frame_start = time.perf_counter()
+
         command = read_command(stdscr)
 
         if command == CMD_QUIT:
             is_game_running = False
-        else:
-            car_lane = move_car(car_lane, command)
+            break
 
-        frame_count += 1
-        if frame_count % SCROLL_FRAME_INTERVAL == 0:
-            offset = update_offset(offset)
+        update_game(state, command, frame_start)
 
         draw_frame(
             stdscr,
@@ -93,11 +124,36 @@ def main(stdscr: curses.window):
             center,
             road_top,
             road_bottom,
-            car_lane,
-            offset,
             cell_styles,
+            state,
+            time.perf_counter(),
         )
-        time.sleep(FRAME_DELAY)
+
+        work_time = time.perf_counter() - frame_start
+
+        # Wait until the scheduled deadline, if time remains.
+        remaining_time = next_frame_deadline - time.perf_counter()
+        if remaining_time > 0:
+            time.sleep(remaining_time)
+
+        frame_end = time.perf_counter()
+
+        # Record actual intervals between frame starts.
+        if previous_frame_start is not None:
+            frame_times.append(frame_start - previous_frame_start)
+        previous_frame_start = frame_start
+
+        work_times.append(work_time)
+
+        # Advance the absolute deadline.
+        next_frame_deadline += FRAME_TIME
+
+        # Skip obsolete deadlines after an overrun.
+        if frame_end >= next_frame_deadline:
+            missed_periods = int((frame_end - next_frame_deadline) // FRAME_TIME) + 1
+            next_frame_deadline += missed_periods * FRAME_TIME
+
+    return frame_times, work_times
 
 
 def setup_curses(stdscr: curses.window):
@@ -144,11 +200,25 @@ def move_car(lane: int, command: Optional[str]) -> int:
     return lane
 
 
-def update_offset(offset: int) -> int:
-    """Return the road's scroll offset after one scroll step."""
-    # Python integers never overflow, and get_row_template wraps the value,
-    # so letting the offset grow is safe.
-    return offset + 1
+def update_game(state: GameState, command: Optional[str], now: float) -> None:
+    elapsed_time = now - state.previous_update_time
+    state.previous_update_time = now
+
+    while now >= state.next_speed_increase and state.speed < MAX_SPEED:
+        state.speed = min(
+            state.speed + SPEED_INCREASE_AMOUNT,
+            MAX_SPEED,
+        )
+        state.next_speed_increase += SPEED_INTERVAL
+
+    state.car_lane = move_car(state.car_lane, command)
+
+    movement = state.speed * elapsed_time
+    state.fractional_movement += movement
+
+    whole_rows = int(state.fractional_movement)
+    state.offset += whole_rows
+    state.fractional_movement -= whole_rows
 
 
 def get_row_template(screen_row: int, road_top: int, offset: int) -> str:
@@ -183,16 +253,36 @@ def draw_frame(
     center: int,
     road_top: int,
     road_bottom: int,
-    car_lane: int,
-    offset: int,
     cell_styles: dict,
-):
-    """Redraw the whole screen from the current game state."""
+    state: GameState,
+    now: float,
+) -> None:
+    """Redraw the screen from the current state."""
     stdscr.erase()
     stdscr.box()
-    draw_hud(stdscr, width)
-    draw_road(stdscr, road_top, road_bottom, center, offset, cell_styles)
-    draw_car(stdscr, road_bottom, lane_to_column(car_lane, center))
+
+    elapsed_seconds = int(now - state.start_time)
+
+    draw_hud(
+        stdscr,
+        width,
+        elapsed_seconds=elapsed_seconds,
+        speed=state.speed,
+    )
+    draw_road(
+        stdscr,
+        road_top,
+        road_bottom,
+        center,
+        state.offset,
+        cell_styles,
+    )
+    draw_car(
+        stdscr,
+        road_bottom,
+        lane_to_column(state.car_lane, center),
+    )
+
     stdscr.refresh()
 
 
@@ -240,7 +330,7 @@ def draw_hud(
     width: int,
     score: int = 0,
     elapsed_seconds: int = 0,
-    speed: int = 0,
+    speed: float = 0,
 ):
     """Draw the boxed status bar showing score, time and speed."""
     top = BORDER
@@ -253,7 +343,7 @@ def draw_hud(
     text_row = top + 1
     score_text = f"Score: {score}"
     time_text = f"Time: {format_time(elapsed_seconds)}"
-    speed_text = f"Speed: {speed:02d}"
+    speed_text = f"Speed: {int(speed - INITIAL_SPEED + 1):02d}"
 
     stdscr.addstr(text_row, left + 2, score_text)
     stdscr.addstr(text_row, left + (inner_width - len(time_text)) // 2, time_text)
@@ -265,5 +355,44 @@ def draw_car(stdscr: curses.window, row: int, column: int):
     stdscr.addstr(row, column, PLAYER_CHAR)
 
 
+def print_performance_summary(
+    frame_times: list[float],
+    work_times: list[float],
+):
+    """Print frame-interval and work-duration statistics."""
+    total_frames = len(work_times)
+    total_intervals = len(frame_times)
+
+    if total_frames == 0:
+        print("No frames were recorded.")
+        return
+
+    avg_work_time = sum(work_times) / total_frames
+    slowest_work = max(work_times)
+
+    print("\n" + "=" * 40)
+    print("         PERFORMANCE SUMMARY          ")
+    print("=" * 40)
+    print(f"Target Frame Rate     : {TARGET_FPS} FPS")
+    print(f"Total Frames Profiled : {total_frames}")
+    print(f"Frame Intervals       : {total_intervals}")
+    print(f"Average Work Time     : {avg_work_time * 1000:.2f} ms")
+    print(f"Slowest Work Time     : {slowest_work * 1000:.2f} ms")
+
+    if total_intervals:
+        avg_frame_time = sum(frame_times) / total_intervals
+        slowest_frame = max(frame_times)
+        implied_fps = 1.0 / avg_frame_time
+
+        print(f"Average Frame Interval: {avg_frame_time * 1000:.2f} ms")
+        print(f"Slowest Frame Interval: {slowest_frame * 1000:.2f} ms")
+        print(f"Implied Frame Rate    : {implied_fps:.2f} FPS")
+    else:
+        print("No frame intervals available.")
+
+    print("=" * 40)
+
+
 if __name__ == "__main__":
-    curses.wrapper(main)
+    frame_times, work_times = curses.wrapper(main)
+    print_performance_summary(frame_times, work_times)
