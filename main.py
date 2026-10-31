@@ -1,7 +1,8 @@
 import curses
+import math
 import time
 from curses import textpad
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 # Layout
@@ -12,6 +13,7 @@ MARKING_GAP = 4  # rows in one repeat of the road pattern
 
 # Characters
 PLAYER_CHAR = "A"
+ENEMY_CHAR = "V"
 
 # Row-template placeholders: stand-ins that the draw step translates
 # into what actually appears on screen (and in which color).
@@ -28,28 +30,20 @@ ROAD_COLOR_PAIR = 1
 # Timing
 TARGET_FPS = 30  # frames per second the loop aims for
 FRAME_TIME = 1 / TARGET_FPS  # seconds each frame should take
+MAX_FRAME_DELTA = 0.1  # seconds; caps elapsed time so a stall can't teleport objects
 
 # Speed progression
-INITIAL_SPEED = 6.0
-MAX_SPEED = 18.0
-SPEED_INTERVAL = 5.0
-SPEED_INCREASE_AMOUNT = 1.0
+INITIAL_SPEED = 6.0  # rows per second at the start
+MAX_SPEED = 18.0  # rows per second, the cap
+SPEED_INTERVAL = 5.0  # seconds between speed increases
+SPEED_INCREASE_AMOUNT = 1.0  # rows per second added at each increase
+
+# Enemies
+ENEMY_START_ROW = -1.0  # road row where new enemies appear (one row above the road)
 
 # Lanes
 LEFT_LANE = 0
 RIGHT_LANE = 1
-
-
-@dataclass
-class GameState:
-    car_lane: int = LEFT_LANE
-    offset: int = 0
-    speed: float = INITIAL_SPEED
-    fractional_movement: float = 0.0
-    start_time: float = 0.0
-    previous_update_time: float = 0.0
-    next_speed_increase: float = 0.0
-
 
 # Commands (what the player wants to do, independent of which key they pressed)
 CMD_LEFT = "left"
@@ -79,17 +73,65 @@ ROW_TEMPLATES = [build_row_template(DIVIDER_CHAR)] + [
 ]
 
 
+@dataclass(frozen=True)
+class Layout:
+    width: int
+    center: int
+    road_top: int
+    road_bottom: int
+
+    @property
+    def road_height(self) -> int:
+        """Number of road rows. Road rows are numbered 0 to road_height - 1."""
+        return self.road_bottom - self.road_top + 1
+
+    @property
+    def player_row(self) -> int:
+        """The player's row in road rows: the last row of the road."""
+        return self.road_height - 1
+
+
+@dataclass
+class Enemy:
+    """One enemy car."""
+
+    lane: int  # LEFT_LANE or RIGHT_LANE
+    row: float  # road row: 0.0 is the first road row, and it grows downward
+    extra_speed: float = (
+        0.0  # rows per second on top of the road speed (used from M4-4)
+    )
+
+
+@dataclass
+class GameState:
+    """Everything that changes while the game runs."""
+
+    car_lane: int = LEFT_LANE
+    offset: int = 0  # whole rows the road has scrolled
+    speed: float = INITIAL_SPEED  # rows per second
+    fractional_movement: float = (
+        0.0  # leftover part of a row, carried to the next frame
+    )
+    elapsed_seconds: int = 0  # whole seconds since the game started
+    start_time: float = 0.0
+    previous_update_time: float = 0.0
+    next_speed_increase: float = 0.0
+    # Each GameState needs its own list, so the default comes from a factory.
+    enemies: list[Enemy] = field(default_factory=list)
+
+
 def main(stdscr: curses.window) -> tuple[list[float], list[float]]:
     """Run the game loop with elapsed-time movement and deadline scheduling.
 
     Returns:
         A tuple containing frame-start intervals and frame work durations,
         both measured in seconds.
+        TEMPORARY enemies and layout
     """
     setup_curses(stdscr)
 
     height, width = stdscr.getmaxyx()
-    center, road_top, road_bottom = compute_layout(height, width)
+    layout = compute_layout(height, width)
     cell_styles = build_road_dict()
 
     start_time = time.perf_counter()
@@ -99,7 +141,10 @@ def main(stdscr: curses.window) -> tuple[list[float], list[float]]:
         next_speed_increase=start_time + SPEED_INTERVAL,
     )
 
-    is_game_running = True
+    # TEMPORARY (M4-3): two hand-placed enemy to test drawing.
+    # Replaced by random spawning in M4-6.
+    state.enemies.append(create_enemy(RIGHT_LANE, row=5.0))
+    state.enemies.append(create_enemy(LEFT_LANE, row=10.0))
 
     frame_times: list[float] = []
     work_times: list[float] = []
@@ -107,27 +152,15 @@ def main(stdscr: curses.window) -> tuple[list[float], list[float]]:
     next_frame_deadline = start_time + FRAME_TIME
     previous_frame_start = None
 
-    while is_game_running:
+    while True:
         frame_start = time.perf_counter()
 
         command = read_command(stdscr)
-
         if command == CMD_QUIT:
-            is_game_running = False
             break
 
-        update_game(state, command, frame_start)
-
-        draw_frame(
-            stdscr,
-            width,
-            center,
-            road_top,
-            road_bottom,
-            cell_styles,
-            state,
-            time.perf_counter(),
-        )
+        update_game(state, command, frame_start, layout)
+        draw_frame(stdscr, layout, cell_styles, state)
 
         work_time = time.perf_counter() - frame_start
 
@@ -153,7 +186,7 @@ def main(stdscr: curses.window) -> tuple[list[float], list[float]]:
             missed_periods = int((frame_end - next_frame_deadline) // FRAME_TIME) + 1
             next_frame_deadline += missed_periods * FRAME_TIME
 
-    return frame_times, work_times
+    return frame_times, work_times, state.enemies, layout
 
 
 def setup_curses(stdscr: curses.window):
@@ -165,12 +198,14 @@ def setup_curses(stdscr: curses.window):
     stdscr.nodelay(True)  # getch() returns immediately instead of waiting
 
 
-def compute_layout(height: int, width: int) -> tuple[int, int, int]:
-    """Return the road's center column, first row and last row."""
-    center = width // 2
-    road_top = BORDER + HUD_HEIGHT  # first row below the HUD
-    road_bottom = height - BORDER - 1  # last usable row above the outer box
-    return center, road_top, road_bottom
+def compute_layout(height: int, width: int) -> Layout:
+    """Work out where the road sits on a terminal of the given size."""
+    return Layout(
+        width=width,
+        center=width // 2,
+        road_top=BORDER + HUD_HEIGHT,  # first row below the HUD
+        road_bottom=height - BORDER - 1,  # last usable row above the outer box
+    )
 
 
 def build_road_dict() -> dict:
@@ -200,25 +235,61 @@ def move_car(lane: int, command: Optional[str]) -> int:
     return lane
 
 
-def update_game(state: GameState, command: Optional[str], now: float) -> None:
-    elapsed_time = now - state.previous_update_time
+def create_enemy(lane: int, row: float = ENEMY_START_ROW) -> Enemy:
+    """Return a new enemy in the given lane, by default just above the road."""
+    return Enemy(lane=lane, row=row)
+
+
+def update_enemies(
+    enemies: list[Enemy], road_speed: float, elapsed_time: float
+) -> None:
+    """Move every enemy down the road, changing the enemies in place."""
+    for enemy in enemies:
+        enemy.row += (road_speed + enemy.extra_speed) * elapsed_time
+
+
+def remove_enemies(enemies: list[Enemy], road_height: int) -> list[Enemy]:
+    """Return only the enemies that have not left the bottom of the road.
+
+    Road rows run from 0 to road_height - 1, so an enemy is gone once row >= road_height.
+    """
+    return [enemy for enemy in enemies if enemy.row < road_height]
+
+
+def update_game(
+    state: GameState, command: Optional[str], now: float, layout: Layout
+) -> None:
+    """Advance the game by one frame, changing `state` in place.
+
+    In order: record the elapsed time, raise the speed if an increase is due,
+    move the car, then scroll the road by speed * elapsed time. Any leftover
+    fraction of a row is carried over to the next frame.
+    """
+    elapsed_time = min(now - state.previous_update_time, MAX_FRAME_DELTA)
     state.previous_update_time = now
+    state.elapsed_seconds = int(now - state.start_time)
 
     while now >= state.next_speed_increase and state.speed < MAX_SPEED:
-        state.speed = min(
-            state.speed + SPEED_INCREASE_AMOUNT,
-            MAX_SPEED,
-        )
+        state.speed = min(state.speed + SPEED_INCREASE_AMOUNT, MAX_SPEED)
         state.next_speed_increase += SPEED_INTERVAL
 
     state.car_lane = move_car(state.car_lane, command)
 
-    movement = state.speed * elapsed_time
-    state.fractional_movement += movement
-
+    state.fractional_movement += state.speed * elapsed_time
     whole_rows = int(state.fractional_movement)
     state.offset += whole_rows
     state.fractional_movement -= whole_rows
+
+    update_enemies(state.enemies, state.speed, elapsed_time)
+    state.enemies = remove_enemies(state.enemies, layout.road_height)
+
+
+def speed_to_level(speed: float) -> int:
+    """Convert speed in rows per second into the level shown in the HUD.
+
+    Level 1 is the starting speed, and each extra row per second is one more level.
+    """
+    return int(speed - INITIAL_SPEED) + 1
 
 
 def get_row_template(screen_row: int, road_top: int, offset: int) -> str:
@@ -237,6 +308,18 @@ def lane_to_column(lane: int, center: int) -> int:
     return center + lane_shift
 
 
+def road_row_to_screen_row(road_row: float, layout: Layout) -> Optional[int]:
+    """Convert a road row to a screen row, or None if it is not on the road.
+
+    Uses floor, not int(): int() rounds toward zero, which would turn -0.5
+    into row 0 and draw an enemy that is still above the road.
+    """
+    screen_row = math.floor(road_row) + layout.road_top
+    if layout.road_top <= screen_row <= layout.road_bottom:
+        return screen_row
+    return None
+
+
 def format_time(total_seconds: int) -> str:
     """Convert a number of seconds into an HH:MM:SS string."""
     hours, remainder = divmod(total_seconds, 3600)
@@ -249,39 +332,23 @@ def format_time(total_seconds: int) -> str:
 
 def draw_frame(
     stdscr: curses.window,
-    width: int,
-    center: int,
-    road_top: int,
-    road_bottom: int,
+    layout: Layout,
     cell_styles: dict,
     state: GameState,
-    now: float,
 ) -> None:
-    """Redraw the screen from the current state."""
+    """Redraw the whole screen from the current state."""
     stdscr.erase()
     stdscr.box()
 
-    elapsed_seconds = int(now - state.start_time)
-
     draw_hud(
         stdscr,
-        width,
-        elapsed_seconds=elapsed_seconds,
-        speed=state.speed,
+        layout.width,
+        elapsed_seconds=state.elapsed_seconds,
+        speed_level=speed_to_level(state.speed),
     )
-    draw_road(
-        stdscr,
-        road_top,
-        road_bottom,
-        center,
-        state.offset,
-        cell_styles,
-    )
-    draw_car(
-        stdscr,
-        road_bottom,
-        lane_to_column(state.car_lane, center),
-    )
+    draw_road(stdscr, layout, state.offset, cell_styles)
+    draw_enemies(stdscr, state.enemies, layout)
+    draw_car(stdscr, layout, state.car_lane)
 
     stdscr.refresh()
 
@@ -312,17 +379,25 @@ def draw_template_row(
 
 def draw_road(
     stdscr: curses.window,
-    road_top: int,
-    road_bottom: int,
-    center: int,
+    layout: Layout,
     offset: int,
     cell_styles: dict,
 ):
     """Draw every road row using the template that the scroll offset selects."""
-    left_column = center - ROAD_HALF_WIDTH
-    for row in range(road_top, road_bottom + 1):
-        template = get_row_template(row, road_top, offset)
+    left_column = layout.center - ROAD_HALF_WIDTH
+    for row in range(layout.road_top, layout.road_bottom + 1):
+        template = get_row_template(row, layout.road_top, offset)
         draw_template_row(stdscr, row, left_column, template, cell_styles)
+
+
+def draw_enemies(stdscr: curses.window, enemies: list[Enemy], layout: Layout):
+    """Draw every enemy that is currently on the road."""
+    for enemy in enemies:
+        screen_row = road_row_to_screen_row(enemy.row, layout)
+        if screen_row is None:
+            continue  # above or below the road: nothing to draw
+        column = lane_to_column(enemy.lane, layout.center)
+        stdscr.addstr(screen_row, column, ENEMY_CHAR)
 
 
 def draw_hud(
@@ -330,9 +405,9 @@ def draw_hud(
     width: int,
     score: int = 0,
     elapsed_seconds: int = 0,
-    speed: float = 0,
+    speed_level: int = 1,
 ):
-    """Draw the boxed status bar showing score, time and speed."""
+    """Draw the boxed status bar showing score, time and speed level."""
     top = BORDER
     bottom = BORDER + HUD_HEIGHT - 1
     left = BORDER
@@ -343,16 +418,22 @@ def draw_hud(
     text_row = top + 1
     score_text = f"Score: {score}"
     time_text = f"Time: {format_time(elapsed_seconds)}"
-    speed_text = f"Speed: {int(speed - INITIAL_SPEED + 1):02d}"
+    speed_text = f"Speed: {speed_level:02d}"
 
     stdscr.addstr(text_row, left + 2, score_text)
     stdscr.addstr(text_row, left + (inner_width - len(time_text)) // 2, time_text)
     stdscr.addstr(text_row, left + inner_width - 2 - len(speed_text), speed_text)
 
 
-def draw_car(stdscr: curses.window, row: int, column: int):
-    """Draw the player car at the given position."""
-    stdscr.addstr(row, column, PLAYER_CHAR)
+def draw_car(stdscr: curses.window, layout: Layout, lane: int) -> None:
+    """Draw the player car in its lane, on the player's road row."""
+    screen_row = road_row_to_screen_row(layout.player_row, layout)
+    if screen_row is None:
+        return
+    stdscr.addstr(screen_row, lane_to_column(lane, layout.center), PLAYER_CHAR)
+
+
+# ---------- Profiling ----------
 
 
 def print_performance_summary(
@@ -394,5 +475,9 @@ def print_performance_summary(
 
 
 if __name__ == "__main__":
-    frame_times, work_times = curses.wrapper(main)
+    frame_times, work_times, enemies, layout = curses.wrapper(main)
+    print("=" * 40)
+    print(layout)
+    print(enemies)
+    print("=" * 40)
     print_performance_summary(frame_times, work_times)
